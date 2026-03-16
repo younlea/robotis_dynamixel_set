@@ -11,6 +11,10 @@ echo "============================================"
 echo " Dynamixel ID Setter — PyInstaller Build"
 echo "============================================"
 
+# Ensure requirements are installed
+echo "[*] Installing dependencies from requirements.txt..."
+pip install -r requirements.txt
+
 # Ensure pyinstaller is available
 if ! command -v pyinstaller &>/dev/null; then
     echo "[!] PyInstaller not found. Installing..."
