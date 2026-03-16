@@ -42,13 +42,32 @@ DXL_ID_MAX = 252
 DEFAULT_BAUDRATE = 57600
 BAUDRATE_OPTIONS = [9600, 57600, 115200, 1000000, 2000000, 3000000, 4000000]
 
+# Model mapping (Internal Model Number -> Friendly Name)
+DXL_MODELS = {
+    1200: "XC330-T288",
+    1210: "XC330-T181",
+    1220: "XC330-M288",
+    1230: "XC330-M181",
+    1100: "XL330-M288",
+    1110: "XL330-M066",
+    1060: "XL430-W250",
+    1020: "XM430-W350",
+    1120: "XM430-W210",
+    1010: "XH430-W350",
+    1130: "XH430-W210",
+    311: "XC430-W150",
+}
+
+def get_model_name(model_number):
+    return DXL_MODELS.get(model_number, f"Unknown ({model_number})")
+
 
 # ──────────────────────────────────────────────
 # Worker thread for scanning (avoids UI freeze)
 # ──────────────────────────────────────────────
 class ScanWorker(QThread):
     """Background thread that pings IDs 0–252."""
-    found_id = pyqtSignal(int)       # emitted per found ID
+    found_id = pyqtSignal(int, int)  # emitted per found ID (dxl_id, model_number)
     progress = pyqtSignal(int)       # emitted with current scan ID
     finished = pyqtSignal(list)      # emitted when scan completes
 
@@ -74,7 +93,7 @@ class ScanWorker(QThread):
                 )
                 if comm_result == COMM_SUCCESS:
                     found.append(dxl_id)
-                    self.found_id.emit(dxl_id)
+                    self.found_id.emit(dxl_id, model_number)
                     if self.stop_on_first:
                         self._abort = True
             except Exception:
@@ -447,9 +466,10 @@ class MainWindow(QMainWindow):
         self.scan_worker.finished.connect(self._on_scan_finished)
         self.scan_worker.start()
 
-    def _on_scan_found(self, dxl_id):
-        self.list_ids.addItem(f"Motor ID: {dxl_id}")
-        self._log(f"[Scan] Found motor at ID {dxl_id}")
+    def _on_scan_found(self, dxl_id, model_num):
+        model_name = get_model_name(model_num)
+        self.list_ids.addItem(f"Motor ID: {dxl_id} [{model_name}]")
+        self._log(f"[Scan] Found motor at ID {dxl_id} ({model_name})")
 
     def _on_scan_progress(self, current_id):
         self.lbl_scan_status.setText(f"Scanning ID {current_id}/252")
@@ -467,9 +487,11 @@ class MainWindow(QMainWindow):
             self._log("[Warning] Multiple motors detected! Connect only ONE motor for safe ID change.")
 
     def _on_id_selected(self, item):
-        text = item.text()  # "Motor ID: X"
+        text = item.text()  # "Motor ID: X [Model]"
         try:
-            dxl_id = int(text.split(":")[1].strip())
+            # Extract only ID
+            id_part = text.split(":")[1].split("[")[0].strip()
+            dxl_id = int(id_part)
             self.lbl_current_id.setText(str(dxl_id))
             self.btn_set_id.setEnabled(True)
         except (IndexError, ValueError):
