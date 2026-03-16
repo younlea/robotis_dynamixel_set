@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# ──────────────────────────────────────────────────────────────
 # build.sh — Build standalone executable (Linux / macOS)
-# ──────────────────────────────────────────────────────────────
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -11,24 +9,39 @@ echo "============================================"
 echo " Dynamixel ID Setter — PyInstaller Build"
 echo "============================================"
 
-# Ensure requirements are installed
-echo "[*] Installing dependencies from requirements.txt..."
-pip install -r requirements.txt
-
-# Ensure pyinstaller is available
-if ! command -v pyinstaller &>/dev/null; then
-    echo "[!] PyInstaller not found. Installing..."
-    pip install pyinstaller
+# Detect python command
+if command -v python3 &>/dev/null; then
+    PYTHON="python3"
+elif command -v python &>/dev/null; then
+    PYTHON="python"
+else
+    echo "[!] Python not found. Please install Python."
+    exit 1
 fi
 
-pyinstaller \
+echo "[*] Using $PYTHON"
+
+# Ensure requirements are installed
+echo "[*] Installing dependencies..."
+$PYTHON -m pip install --upgrade pip
+$PYTHON -m pip install -r requirements.txt
+
+# Run PyInstaller
+echo "[*] Running PyInstaller..."
+$PYTHON -m PyInstaller \
     --onefile \
     --noconsole \
     --name DynamixelIDSetter \
     --clean \
     main.py
 
-echo ""
-echo "✔ Build complete!"
-echo "  Executable: dist/DynamixelIDSetter"
-echo ""
+if [ $? -eq 0 ]; then
+    echo ""
+    echo "✔ Build complete!"
+    echo "  Executable: dist/DynamixelIDSetter"
+    echo ""
+else
+    echo "[!] Build failed!"
+    exit 1
+fi
+
