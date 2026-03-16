@@ -117,17 +117,17 @@ class DynamixelManager:
         self.is_open = False
 
     # ── ID change ─────────────────────────────
-    def set_id(self, current_id: int, new_id: int):
+    def set_id(self, current_id: int, new_id: int, log_callback=None):
         """
         Change motor ID.
         Returns (success: bool, message: str).
-        Sequence: Torque Off → Write new ID → Ping new ID to verify.
         """
         if not self.is_open:
             return False, "Port is not open."
 
         ph = self.port_handler
         pk = self.packet_handler
+        warnings = []
 
         # 1. Torque Off
         try:
@@ -135,11 +135,10 @@ class DynamixelManager:
             if comm_result != COMM_SUCCESS:
                 return False, f"Torque Off failed: {pk.getTxRxResult(comm_result)}"
             if dxl_error != 0:
-                # [Optimization] Log Hardware Error but don't fail immediately, as some motors might report it while functioning
-                error_msg = pk.getRxPacketError(dxl_error)
-                print(f"[Warning] Torque Off DXL error: {error_msg}")
-                # If it's JUST a hardware error status, we can try to proceed.
-                # However, if it's a critical error (like checksum), the SDK usually handles it in comm_result.
+                err_msg = pk.getRxPacketError(dxl_error)
+                warnings.append(f"Torque Off status: {err_msg}")
+                if log_callback:
+                    log_callback(f"[Warning] {err_msg}")
         except Exception as e:
             return False, f"Torque Off exception: {e}"
 
@@ -149,9 +148,10 @@ class DynamixelManager:
             if comm_result != COMM_SUCCESS:
                 return False, f"ID Write failed: {pk.getTxRxResult(comm_result)}"
             if dxl_error != 0:
-                # [Optimization] Log Hardware Error but proceed with verification
-                error_msg = pk.getRxPacketError(dxl_error)
-                print(f"[Warning] ID Write DXL error: {error_msg}")
+                err_msg = pk.getRxPacketError(dxl_error)
+                warnings.append(f"ID Write status: {err_msg}")
+                if log_callback:
+                    log_callback(f"[Warning] {err_msg}")
         except Exception as e:
             return False, f"ID Write exception: {e}"
 
@@ -160,7 +160,11 @@ class DynamixelManager:
             _, comm_result, dxl_error = pk.ping(ph, new_id)
             if comm_result != COMM_SUCCESS:
                 return False, f"Verification ping failed: {pk.getTxRxResult(comm_result)}"
-            return True, f"ID changed successfully: {current_id} → {new_id}"
+            
+            success_msg = f"ID changed successfully: {current_id} → {new_id}"
+            if warnings:
+                success_msg += f" (Note: {len(warnings)} warnings occurred)"
+            return True, success_msg
         except Exception as e:
             return False, f"Verification exception: {e}"
 
@@ -498,7 +502,7 @@ class MainWindow(QMainWindow):
             return
 
         self._log(f"[ID] Changing ID: {current_id} → {new_id} …")
-        success, msg = self.dxl.set_id(current_id, new_id)
+        success, msg = self.dxl.set_id(current_id, new_id, log_callback=self._log)
         if success:
             self._log(f"[ID] ✔ {msg}")
             self.lbl_current_id.setText(str(new_id))
