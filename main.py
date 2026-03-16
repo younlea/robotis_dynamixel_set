@@ -56,6 +56,7 @@ DXL_MODELS = {
     1010: "XH430-W350",
     1130: "XH430-W210",
     311: "XC430-W150",
+    1240: "XC330-M288-T",
 }
 
 def get_model_name(model_number):
