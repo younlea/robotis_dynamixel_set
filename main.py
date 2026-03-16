@@ -12,7 +12,7 @@ import platform
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QComboBox, QPushButton, QSpinBox,
-    QPlainTextEdit, QListWidget, QMessageBox, QSizePolicy
+    QPlainTextEdit, QListWidget, QMessageBox, QSizePolicy, QCheckBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon
@@ -52,10 +52,11 @@ class ScanWorker(QThread):
     progress = pyqtSignal(int)       # emitted with current scan ID
     finished = pyqtSignal(list)      # emitted when scan completes
 
-    def __init__(self, port_handler, packet_handler, parent=None):
+    def __init__(self, port_handler, packet_handler, stop_on_first=False, parent=None):
         super().__init__(parent)
         self.port_handler = port_handler
         self.packet_handler = packet_handler
+        self.stop_on_first = stop_on_first
         self._abort = False
 
     def abort(self):
@@ -74,6 +75,8 @@ class ScanWorker(QThread):
                 if comm_result == COMM_SUCCESS:
                     found.append(dxl_id)
                     self.found_id.emit(dxl_id)
+                    if self.stop_on_first:
+                        self._abort = True
             except Exception:
                 pass
         self.finished.emit(found)
@@ -132,7 +135,11 @@ class DynamixelManager:
             if comm_result != COMM_SUCCESS:
                 return False, f"Torque Off failed: {pk.getTxRxResult(comm_result)}"
             if dxl_error != 0:
-                return False, f"Torque Off DXL error: {pk.getRxPacketError(dxl_error)}"
+                # [Optimization] Log Hardware Error but don't fail immediately, as some motors might report it while functioning
+                error_msg = pk.getRxPacketError(dxl_error)
+                print(f"[Warning] Torque Off DXL error: {error_msg}")
+                # If it's JUST a hardware error status, we can try to proceed.
+                # However, if it's a critical error (like checksum), the SDK usually handles it in comm_result.
         except Exception as e:
             return False, f"Torque Off exception: {e}"
 
@@ -251,6 +258,12 @@ class MainWindow(QMainWindow):
         self.btn_scan.setEnabled(False)
         self.btn_scan.clicked.connect(self._start_scan)
         row_scan_btn.addWidget(self.btn_scan)
+
+        self.cb_stop_fast = QCheckBox("Quick Scan (Stop at first ID)")
+        self.cb_stop_fast.setStyleSheet("color: #00e676;")
+        self.cb_stop_fast.setChecked(True)
+        row_scan_btn.addWidget(self.cb_stop_fast)
+
         self.lbl_scan_status = QLabel("")
         row_scan_btn.addWidget(self.lbl_scan_status)
         lay_scan.addLayout(row_scan_btn)
@@ -415,9 +428,14 @@ class MainWindow(QMainWindow):
         self.btn_set_id.setEnabled(False)
         self.btn_scan.setEnabled(False)
 
-        self._log("[Scan] Scanning IDs 0–252 …")
+        stop_on_first = self.cb_stop_fast.isChecked()
+        self._log(f"[Scan] Scanning IDs 0–252 … {'(Fast Mode)' if stop_on_first else ''}")
 
-        self.scan_worker = ScanWorker(self.dxl.port_handler, self.dxl.packet_handler)
+        self.scan_worker = ScanWorker(
+            self.dxl.port_handler, 
+            self.dxl.packet_handler, 
+            stop_on_first=stop_on_first
+        )
         self.scan_worker.found_id.connect(self._on_scan_found)
         self.scan_worker.progress.connect(self._on_scan_progress)
         self.scan_worker.finished.connect(self._on_scan_finished)
