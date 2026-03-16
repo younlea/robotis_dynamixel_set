@@ -149,7 +149,9 @@ class DynamixelManager:
             if comm_result != COMM_SUCCESS:
                 return False, f"ID Write failed: {pk.getTxRxResult(comm_result)}"
             if dxl_error != 0:
-                return False, f"ID Write DXL error: {pk.getRxPacketError(dxl_error)}"
+                # [Optimization] Log Hardware Error but proceed with verification
+                error_msg = pk.getRxPacketError(dxl_error)
+                print(f"[Warning] ID Write DXL error: {error_msg}")
         except Exception as e:
             return False, f"ID Write exception: {e}"
 
