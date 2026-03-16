@@ -13,14 +13,17 @@
 
 ---
 
-## 🚀 Quick Start — 바이너리 실행 (사용자용)
+## 🚀 Quick Start — 실행 방법 (사용자용)
 
-[Releases](../../releases) 탭에서 OS에 맞는 파일을 다운로드한 뒤 실행하세요. Python 설치가 필요 없습니다.
+본 툴은 파이썬 설치 없이 실행 가능한 **독립형 바이너리(Standalone Executable)** 빌드를 지원합니다.
 
-### Windows
-1. `DynamixelIDSetter.exe` 다운로드
-2. 더블 클릭으로 실행
-3. Windows Defender 경고 시: **"추가 정보" → "실행"** 클릭
+### 1. 직접 빌드하여 사용하기 (가장 확실한 방법)
+현재 프로젝트에는 빌드 스크립트가 포함되어 있습니다. 본인의 OS에서 다음 스크립트를 실행하면 `dist/` 폴더 내에 실행 파일이 생성됩니다.
+- **Windows:** `build.bat` 실행
+- **Linux / macOS:** `./build.sh` 실행
+
+### 2. 배포된 바이너리 사용
+개발자가 빌드 후 GitHub [Releases](../../releases) 탭에 업로드한 경우, 해당 탭에서 본인의 OS에 맞는 파일을 다운로드하여 즉시 사용할 수 있습니다. (현재는 소스코드와 빌드 스크립트가 제공되는 단계입니다.)
 
 ### Ubuntu / Linux
 ```bash
