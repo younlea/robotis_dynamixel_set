@@ -238,145 +238,136 @@ class DynamixelManager:
             if log_callback:
                 log_callback(msg)
 
-        # Step a. Torque Off (EEPROM write requires torque disabled)
+        # Step 1. Torque Off (EEPROM write requires torque disabled)
         try:
             comm_result, dxl_error = pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
             if comm_result != COMM_SUCCESS:
                 return False, f"Torque Off failed: {pk.getTxRxResult(comm_result)}", 0
             if dxl_error != 0:
-                _log(f"[Warning] Torque Off status: {pk.getRxPacketError(dxl_error)}")
-            _log(f"[Homing] Step 1/6: Torque disabled for ID {dxl_id}")
+                _log(f"[Warning] Torque Off: {pk.getRxPacketError(dxl_error)}")
+            _log(f"[Homing] Step 1/7: Torque disabled for ID {dxl_id}")
         except Exception as e:
             return False, f"Torque Off exception: {e}", 0
 
-        # Read current Operating Mode (to restore later and check offset limit)
+        # Read current Operating Mode
         original_op_mode = None
         try:
             raw_mode, comm_result, dxl_error = pk.read1ByteTxRx(ph, dxl_id, ADDR_OPERATING_MODE)
             if comm_result == COMM_SUCCESS:
                 original_op_mode = raw_mode
-                _log(f"[Homing] Current Operating Mode = {original_op_mode}")
+                _log(f"[Homing] Operating Mode = {original_op_mode}")
         except Exception:
             _log("[Warning] Could not read Operating Mode")
 
-        # Step b. Read current Homing Offset and Present Position
+        # Step 2. Reset Homing Offset to 0 (clean slate)
+        # Previous failed attempts may have left garbage values in EEPROM.
         try:
-            raw_offset, comm_result, dxl_error = pk.read4ByteTxRx(ph, dxl_id, ADDR_HOMING_OFFSET)
-            if comm_result != COMM_SUCCESS:
-                return False, f"Read Homing Offset failed: {pk.getTxRxResult(comm_result)}", 0
-            if dxl_error != 0:
-                _log(f"[Warning] Read Homing Offset status: {pk.getRxPacketError(dxl_error)}")
-            current_offset = to_signed32(raw_offset)
-            _log(f"[Homing] Step 2/6: Current Homing Offset = {current_offset}")
+            pk.write4ByteTxRx(ph, dxl_id, ADDR_HOMING_OFFSET, 0)
+            time.sleep(0.1)
+            _log(f"[Homing] Step 2/7: Homing Offset reset to 0 (clean slate)")
         except Exception as e:
-            return False, f"Read Homing Offset exception: {e}", 0
+            return False, f"Reset Homing Offset exception: {e}", 0
 
+        # Step 3. Read raw Present Position (with offset=0 this is true encoder value)
         try:
             raw_pos, comm_result, dxl_error = pk.read4ByteTxRx(ph, dxl_id, ADDR_PRESENT_POSITION)
             if comm_result != COMM_SUCCESS:
-                return False, f"Read Present Position failed: {pk.getTxRxResult(comm_result)}", 0
+                return False, f"Read Position failed: {pk.getTxRxResult(comm_result)}", 0
             if dxl_error != 0:
-                _log(f"[Warning] Read Present Position status: {pk.getRxPacketError(dxl_error)}")
-            current_position = to_signed32(raw_pos)
-            _log(f"[Homing] Step 2/6: Current Present Position = {current_position}")
+                _log(f"[Warning] Read Position: {pk.getRxPacketError(dxl_error)}")
+            raw_position = to_signed32(raw_pos)
+            _log(f"[Homing] Step 3/7: Raw encoder position = {raw_position}")
         except Exception as e:
-            return False, f"Read Present Position exception: {e}", 0
+            return False, f"Read Position exception: {e}", 0
 
-        # Step c. Calculate new offset
-        new_offset = current_offset - current_position
-        _log(f"[Homing] Step 3/6: New Homing Offset = {current_offset} - {current_position} = {new_offset}")
+        if raw_position == 0:
+            _log(f"[Homing] Position already 0, no offset needed")
+            pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
+            return True, "Homing 설정 완료 (이미 0)", 0
 
-        # Check if offset exceeds Position Control Mode limit (±1024)
-        # If so, temporarily switch to Extended Position Control Mode (mode 4)
-        mode_switched = False
-        if original_op_mode is not None and abs(new_offset) > HOMING_OFFSET_JOINT_LIMIT:
-            if original_op_mode != OP_MODE_EXTENDED_POSITION:
-                _log(f"[Homing] Offset {new_offset} exceeds ±{HOMING_OFFSET_JOINT_LIMIT} limit for mode {original_op_mode}")
-                _log(f"[Homing] Temporarily switching to Extended Position Control Mode (mode 4)")
+        # Step 4. Calculate offset = negate raw position
+        new_offset = -raw_position
+        _log(f"[Homing] Step 4/7: New Homing Offset = {new_offset}")
+
+        # If offset exceeds ±1024 and motor is in Position Control Mode (3),
+        # switch to Extended Position Control Mode (4) PERMANENTLY.
+        # Mode 3 silently ignores offsets outside ±1024.
+        mode_changed = False
+        if abs(new_offset) > HOMING_OFFSET_JOINT_LIMIT:
+            if original_op_mode is not None and original_op_mode != OP_MODE_EXTENDED_POSITION:
+                _log(f"[Homing] ⚠ |{new_offset}| > {HOMING_OFFSET_JOINT_LIMIT}: mode {original_op_mode} would ignore this offset")
+                _log(f"[Homing] Changing to Extended Position Mode (4) — mode {original_op_mode} cannot use this offset")
                 try:
                     comm_result, dxl_error = pk.write1ByteTxRx(
-                        ph, dxl_id, ADDR_OPERATING_MODE, OP_MODE_EXTENDED_POSITION
-                    )
+                        ph, dxl_id, ADDR_OPERATING_MODE, OP_MODE_EXTENDED_POSITION)
                     if comm_result == COMM_SUCCESS:
-                        mode_switched = True
+                        mode_changed = True
                     else:
-                        _log(f"[Warning] Failed to switch Operating Mode: {pk.getTxRxResult(comm_result)}")
+                        return False, f"Mode switch failed: {pk.getTxRxResult(comm_result)}", 0
                 except Exception as e:
-                    _log(f"[Warning] Operating Mode switch exception: {e}")
+                    return False, f"Mode switch exception: {e}", 0
 
-        # Step d. Write new Homing Offset
+        # Step 5. Write new Homing Offset
         try:
             write_value = to_unsigned32(new_offset)
             comm_result, dxl_error = pk.write4ByteTxRx(ph, dxl_id, ADDR_HOMING_OFFSET, write_value)
             if comm_result != COMM_SUCCESS:
-                return False, f"Write Homing Offset failed: {pk.getTxRxResult(comm_result)}", 0
+                return False, f"Write Offset failed: {pk.getTxRxResult(comm_result)}", 0
             if dxl_error != 0:
-                _log(f"[Warning] Write Homing Offset status: {pk.getRxPacketError(dxl_error)}")
-            _log(f"[Homing] Step 4/6: Homing Offset written = {new_offset}")
+                _log(f"[Warning] Write Offset: {pk.getRxPacketError(dxl_error)}")
+            _log(f"[Homing] Step 5/7: Homing Offset written = {new_offset}")
         except Exception as e:
-            return False, f"Write Homing Offset exception: {e}", 0
+            return False, f"Write Offset exception: {e}", 0
 
-        # Wait for EEPROM write, then read back to verify
+        # Read back to verify EEPROM write
         time.sleep(0.2)
         try:
-            raw_readback, comm_result, dxl_error = pk.read4ByteTxRx(ph, dxl_id, ADDR_HOMING_OFFSET)
+            raw_rb, comm_result, _ = pk.read4ByteTxRx(ph, dxl_id, ADDR_HOMING_OFFSET)
             if comm_result == COMM_SUCCESS:
-                readback_offset = to_signed32(raw_readback)
-                _log(f"[Homing] Step 4/6: Homing Offset read-back = {readback_offset}")
-                if readback_offset != new_offset:
-                    return False, f"EEPROM write verification failed: wrote {new_offset}, read back {readback_offset}", 0
+                rb = to_signed32(raw_rb)
+                _log(f"[Homing] Step 5/7: Read-back = {rb}")
+                if rb != new_offset:
+                    return False, f"EEPROM verify failed: wrote {new_offset}, read {rb}", 0
         except Exception:
-            _log("[Warning] Could not read back Homing Offset for verification")
+            pass
 
-        # Restore original Operating Mode if we switched it
-        if mode_switched and original_op_mode is not None:
-            _log(f"[Homing] Restoring Operating Mode to {original_op_mode}")
-            try:
-                pk.write1ByteTxRx(ph, dxl_id, ADDR_OPERATING_MODE, original_op_mode)
-            except Exception:
-                _log("[Warning] Could not restore Operating Mode")
-
-        # Step e. Reboot motor to apply changes cleanly
+        # Step 6. Reboot motor to apply
         try:
-            comm_result, dxl_error = pk.reboot(ph, dxl_id)
+            comm_result, _ = pk.reboot(ph, dxl_id)
             if comm_result != COMM_SUCCESS:
-                _log(f"[Warning] Reboot failed: {pk.getTxRxResult(comm_result)}, enabling torque directly")
                 pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
             else:
-                _log(f"[Homing] Step 5/6: Reboot sent to ID {dxl_id}, waiting for restart…")
+                _log(f"[Homing] Step 6/7: Reboot sent to ID {dxl_id}")
         except Exception:
-            _log("[Warning] Reboot not supported, enabling torque directly")
             pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
 
-        # Wait for motor to reboot and come back online
         time.sleep(1.0)
         for retry in range(10):
             try:
                 _, comm_result, _ = pk.ping(ph, dxl_id)
                 if comm_result == COMM_SUCCESS:
-                    _log(f"[Homing] Step 5/6: Motor ID {dxl_id} is back online")
+                    _log(f"[Homing] Step 6/7: Motor ID {dxl_id} back online")
                     break
             except Exception:
                 pass
             time.sleep(0.3)
         else:
-            return False, f"Motor ID {dxl_id} did not respond after reboot", 0
+            return False, f"Motor ID {dxl_id} no response after reboot", 0
 
-        # Enable torque after reboot
         try:
             pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
         except Exception:
             pass
 
-        # Step f. Verify — read Present Position with retries
+        # Step 7. Verify Present Position
         verified_position = None
         for attempt in range(5):
             try:
                 time.sleep(0.3)
-                raw_verify, comm_result, dxl_error = pk.read4ByteTxRx(ph, dxl_id, ADDR_PRESENT_POSITION)
+                raw_v, comm_result, _ = pk.read4ByteTxRx(ph, dxl_id, ADDR_PRESENT_POSITION)
                 if comm_result == COMM_SUCCESS:
-                    verified_position = to_signed32(raw_verify)
-                    _log(f"[Homing] Step 6/6: Verified Position = {verified_position} (attempt {attempt + 1})")
+                    verified_position = to_signed32(raw_v)
+                    _log(f"[Homing] Step 7/7: Position = {verified_position} (attempt {attempt + 1})")
                     if verified_position == 0:
                         break
             except Exception:
@@ -385,9 +376,12 @@ class DynamixelManager:
         if verified_position is None:
             return False, f"Verification read failed for ID {dxl_id}", 0
         elif verified_position == 0:
-            return True, "Homing 설정 완료", 0
+            extra = ""
+            if mode_changed:
+                extra = f" (Operating Mode: {original_op_mode} → {OP_MODE_EXTENDED_POSITION})"
+            return True, f"Homing 설정 완료{extra}", 0
         else:
-            return False, f"검증 실패: 위치가 0으로 초기화되지 않았습니다 (현재값: {verified_position})", verified_position
+            return False, f"검증 실패: 위치 {verified_position} (expected 0)", verified_position
 
 
 
