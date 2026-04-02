@@ -7,6 +7,7 @@ Cross-platform (Windows / Ubuntu / macOS) PyQt5 application using dynamixel_sdk 
 """
 
 import sys
+import time
 import platform
 
 from PyQt5.QtWidgets import (
@@ -294,6 +295,9 @@ class DynamixelManager:
             _log(f"[Homing] Step 5/6: Torque enabled for ID {dxl_id}")
         except Exception as e:
             return False, f"Torque On exception: {e}", 0
+
+        # Brief delay for firmware to apply new Homing Offset to Present Position
+        time.sleep(0.3)
 
         # Step f. Verify — read Present Position, should be 0
         try:
