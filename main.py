@@ -417,7 +417,8 @@ class MainWindow(QMainWindow):
         lay_scan.addLayout(row_scan_btn)
 
         self.list_ids = QListWidget()
-        self.list_ids.setMaximumHeight(80)
+        self.list_ids.setMaximumHeight(140)
+        self.list_ids.setSelectionMode(QListWidget.ExtendedSelection)
         self.list_ids.itemClicked.connect(self._on_id_selected)
         lay_scan.addWidget(self.list_ids)
 
@@ -456,9 +457,7 @@ class MainWindow(QMainWindow):
         grp_zero = QGroupBox("Set Zero (Homing)")
         lay_zero = QVBoxLayout()
 
-        self.btn_set_zero = QPushButton("Set Zero (Homing)")
-        self.btn_set_zero.setEnabled(False)
-        self.btn_set_zero.setStyleSheet("""
+        _zero_btn_style = """
             QPushButton {
                 background: #c67c00;
                 color: #fff;
@@ -471,9 +470,23 @@ class MainWindow(QMainWindow):
             QPushButton:hover { background: #e09100; }
             QPushButton:pressed { background: #a06500; }
             QPushButton:disabled { background: #555; color: #888; }
-        """)
-        self.btn_set_zero.clicked.connect(self._set_zero)
-        lay_zero.addWidget(self.btn_set_zero)
+        """
+
+        row_zero_btns = QHBoxLayout()
+
+        self.btn_set_zero_selected = QPushButton("Set Zero (Selected)")
+        self.btn_set_zero_selected.setEnabled(False)
+        self.btn_set_zero_selected.setStyleSheet(_zero_btn_style)
+        self.btn_set_zero_selected.clicked.connect(self._set_zero_selected)
+        row_zero_btns.addWidget(self.btn_set_zero_selected)
+
+        self.btn_set_zero_all = QPushButton("Set Zero (All Motors)")
+        self.btn_set_zero_all.setEnabled(False)
+        self.btn_set_zero_all.setStyleSheet(_zero_btn_style)
+        self.btn_set_zero_all.clicked.connect(self._set_zero_all)
+        row_zero_btns.addWidget(self.btn_set_zero_all)
+
+        lay_zero.addLayout(row_zero_btns)
 
         lbl_zero_desc = QLabel(
             "⚠  선택된 모터의 현재 물리적 위치를 0점으로 영구 설정합니다.\n"
@@ -590,7 +603,8 @@ class MainWindow(QMainWindow):
         self.btn_open.setChecked(False)
         self.btn_scan.setEnabled(False)
         self.btn_set_id.setEnabled(False)
-        self.btn_set_zero.setEnabled(False)
+        self.btn_set_zero_selected.setEnabled(False)
+        self.btn_set_zero_all.setEnabled(False)
         self.combo_port.setEnabled(True)
         self.combo_baud.setEnabled(True)
         self.btn_refresh.setEnabled(True)
@@ -641,9 +655,11 @@ class MainWindow(QMainWindow):
         if len(found_list) == 1:
             self.lbl_current_id.setText(str(found_list[0]))
             self.btn_set_id.setEnabled(True)
-            self.btn_set_zero.setEnabled(True)
+            self.btn_set_zero_selected.setEnabled(True)
+            self.btn_set_zero_all.setEnabled(True)
         elif len(found_list) > 1:
             self._log("[Warning] Multiple motors detected! Connect only ONE motor for safe ID change.")
+            self.btn_set_zero_all.setEnabled(True)
 
     def _on_id_selected(self, item):
         text = item.text()  # "Motor ID: X [Model] (Position: Y)"
@@ -653,7 +669,7 @@ class MainWindow(QMainWindow):
             dxl_id = int(id_part)
             self.lbl_current_id.setText(str(dxl_id))
             self.btn_set_id.setEnabled(True)
-            self.btn_set_zero.setEnabled(True)
+            self.btn_set_zero_selected.setEnabled(True)
         except (IndexError, ValueError):
             pass
 
@@ -696,18 +712,33 @@ class MainWindow(QMainWindow):
             self._log(f"[ID] ✘ {msg}")
 
     # ── Set Zero (Homing) ────────────────────
-    def _set_zero(self):
-        try:
-            dxl_id = int(self.lbl_current_id.text())
-        except ValueError:
-            self._log("[Error] No motor ID selected.")
+    def _set_zero_selected(self):
+        """Home only the selected motor(s) in the list."""
+        selected_items = self.list_ids.selectedItems()
+        if not selected_items:
+            self._log("[Error] No motor selected. Click on motor(s) in the list first.")
+            QMessageBox.warning(self, "No Selection", "리스트에서 모터를 선택해 주세요.\nPlease select motor(s) from the list.")
             return
 
+        # Extract IDs from selected items
+        target_ids = []
+        for item in selected_items:
+            try:
+                id_part = item.text().split(":")[1].split("[")[0].strip()
+                target_ids.append(int(id_part))
+            except (IndexError, ValueError):
+                pass
+
+        if not target_ids:
+            self._log("[Error] Could not parse motor IDs from selection.")
+            return
+
+        id_list_str = ", ".join(str(i) for i in target_ids)
         reply = QMessageBox.question(
             self,
-            "Confirm Homing",
-            f"모터 ID {dxl_id}의 현재 위치를 0점(Zero Point)으로 설정합니다.\n"
-            f"Set motor ID {dxl_id}'s current position as zero point?\n\n"
+            "Confirm Homing (Selected)",
+            f"선택된 {len(target_ids)}개 모터의 현재 위치를 0점으로 설정합니다.\n"
+            f"Set zero for motor ID(s): {id_list_str}?\n\n"
             "이 작업은 Homing Offset(EEPROM)을 변경합니다.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -716,29 +747,81 @@ class MainWindow(QMainWindow):
             self._log("[Info] Homing cancelled by user.")
             return
 
-        self._log(f"[Homing] Starting homing sequence for motor ID {dxl_id} …")
-        success, msg, verified_pos = self.dxl.set_zero_homing(dxl_id, log_callback=self._log)
+        self._perform_homing_batch(target_ids)
 
-        if success:
-            self._log(f"[Homing] ✔ {msg}")
-            QMessageBox.information(self, "Homing Complete", msg)
-            # Update the position text in the list widget
-            for i in range(self.list_ids.count()):
-                item = self.list_ids.item(i)
-                text = item.text()
-                try:
-                    id_part = text.split(":")[1].split("[")[0].strip()
-                    if int(id_part) == dxl_id:
-                        # Rebuild item text with Position: 0
-                        model_part = text.split("[")[1].split("]")[0] if "[" in text else ""
-                        item.setText(f"Motor ID: {dxl_id} [{model_part}] (Position: 0)")
-                        break
-                except (IndexError, ValueError):
-                    pass
+    def _set_zero_all(self):
+        """Home all scanned motors."""
+        if not self.found_ids:
+            self._log("[Error] No motors found. Run a scan first.")
+            return
+
+        id_list_str = ", ".join(str(i) for i in self.found_ids)
+        reply = QMessageBox.question(
+            self,
+            "Confirm Homing (All Motors)",
+            f"스캔된 모든 모터({len(self.found_ids)}개)의 현재 위치를 0점으로 설정합니다.\n"
+            f"Set zero for ALL motor ID(s): {id_list_str}?\n\n"
+            "이 작업은 Homing Offset(EEPROM)을 변경합니다.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            self._log("[Info] Homing cancelled by user.")
+            return
+
+        self._perform_homing_batch(list(self.found_ids))
+
+    def _perform_homing_batch(self, target_ids):
+        """Execute homing sequence for a list of motor IDs."""
+        total = len(target_ids)
+        success_ids = []
+        fail_ids = []
+
+        self._log(f"[Homing] Starting homing for {total} motor(s): {target_ids}")
+
+        for idx, dxl_id in enumerate(target_ids, 1):
+            self._log(f"[Homing] ── Motor {idx}/{total} (ID: {dxl_id}) ──")
+            success, msg, verified_pos = self.dxl.set_zero_homing(dxl_id, log_callback=self._log)
+
+            if success:
+                self._log(f"[Homing] ✔ ID {dxl_id}: {msg}")
+                success_ids.append(dxl_id)
+                self._update_list_position(dxl_id, 0)
+            else:
+                self._log(f"[Homing] ✘ ID {dxl_id}: {msg}")
+                self._log(f"[Homing] Verified position after attempt: {verified_pos}")
+                fail_ids.append((dxl_id, msg))
+
+        # Summary
+        self._log(f"[Homing] ════ Result: {len(success_ids)} succeeded, {len(fail_ids)} failed ════")
+
+        if fail_ids:
+            fail_detail = "\n".join(f"  ID {fid}: {fmsg}" for fid, fmsg in fail_ids)
+            QMessageBox.warning(
+                self, "Homing Partial/Failure",
+                f"성공: {len(success_ids)}개, 실패: {len(fail_ids)}개\n\n"
+                f"실패 목록:\n{fail_detail}"
+            )
         else:
-            self._log(f"[Homing] ✘ {msg}")
-            self._log(f"[Homing] Verified position after attempt: {verified_pos}")
-            QMessageBox.critical(self, "Homing Failed", msg)
+            QMessageBox.information(
+                self, "Homing Complete",
+                f"모든 모터({len(success_ids)}개) Homing 설정 완료!\n"
+                f"All {len(success_ids)} motor(s) homed successfully."
+            )
+
+    def _update_list_position(self, dxl_id, position):
+        """Update the position text for a given motor ID in the list widget."""
+        for i in range(self.list_ids.count()):
+            item = self.list_ids.item(i)
+            text = item.text()
+            try:
+                id_part = text.split(":")[1].split("[")[0].strip()
+                if int(id_part) == dxl_id:
+                    model_part = text.split("[")[1].split("]")[0] if "[" in text else ""
+                    item.setText(f"Motor ID: {dxl_id} [{model_part}] (Position: {position})")
+                    break
+            except (IndexError, ValueError):
+                pass
 
     # ── Window close ──────────────────────────
     def closeEvent(self, event):
