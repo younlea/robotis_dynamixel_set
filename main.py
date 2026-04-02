@@ -285,31 +285,72 @@ class DynamixelManager:
         except Exception as e:
             return False, f"Write Homing Offset exception: {e}", 0
 
-        # Step e. Torque On
+        # Wait for EEPROM write to complete, then read back to verify
+        time.sleep(0.2)
+        try:
+            raw_readback, comm_result, dxl_error = pk.read4ByteTxRx(ph, dxl_id, ADDR_HOMING_OFFSET)
+            if comm_result == COMM_SUCCESS:
+                readback_offset = to_signed32(raw_readback)
+                _log(f"[Homing] Step 4/6: Homing Offset read-back = {readback_offset}")
+                if readback_offset != new_offset:
+                    return False, f"EEPROM write verification failed: wrote {new_offset}, read back {readback_offset}", 0
+        except Exception:
+            _log("[Warning] Could not read back Homing Offset for verification")
+
+        # Step e. Reboot motor to apply new Homing Offset
+        try:
+            comm_result, dxl_error = pk.reboot(ph, dxl_id)
+            if comm_result != COMM_SUCCESS:
+                _log(f"[Warning] Reboot command failed: {pk.getTxRxResult(comm_result)}, trying torque on instead")
+                # Fallback: just enable torque
+                comm_result, dxl_error = pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
+            else:
+                _log(f"[Homing] Step 5/6: Reboot sent to ID {dxl_id}, waiting for restart…")
+        except Exception:
+            _log("[Warning] Reboot not supported, enabling torque directly")
+            pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
+
+        # Wait for motor to reboot and come back online
+        time.sleep(1.0)
+
+        # Ping to confirm motor is back
+        for retry in range(10):
+            try:
+                _, comm_result, _ = pk.ping(ph, dxl_id)
+                if comm_result == COMM_SUCCESS:
+                    _log(f"[Homing] Step 5/6: Motor ID {dxl_id} is back online")
+                    break
+            except Exception:
+                pass
+            time.sleep(0.3)
+        else:
+            return False, f"Motor ID {dxl_id} did not respond after reboot", 0
+
+        # Enable torque after reboot
         try:
             comm_result, dxl_error = pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
             if comm_result != COMM_SUCCESS:
-                return False, f"Torque On failed: {pk.getTxRxResult(comm_result)}", 0
-            if dxl_error != 0:
-                _log(f"[Warning] Torque On status: {pk.getRxPacketError(dxl_error)}")
-            _log(f"[Homing] Step 5/6: Torque enabled for ID {dxl_id}")
-        except Exception as e:
-            return False, f"Torque On exception: {e}", 0
+                _log(f"[Warning] Torque On after reboot failed: {pk.getTxRxResult(comm_result)}")
+        except Exception:
+            pass
 
-        # Brief delay for firmware to apply new Homing Offset to Present Position
-        time.sleep(0.3)
+        # Step f. Verify — read Present Position with retries
+        verified_position = None
+        for attempt in range(5):
+            try:
+                time.sleep(0.3)
+                raw_verify, comm_result, dxl_error = pk.read4ByteTxRx(ph, dxl_id, ADDR_PRESENT_POSITION)
+                if comm_result == COMM_SUCCESS:
+                    verified_position = to_signed32(raw_verify)
+                    _log(f"[Homing] Step 6/6: Verified Position = {verified_position} (attempt {attempt + 1})")
+                    if verified_position == 0:
+                        break
+            except Exception:
+                pass
 
-        # Step f. Verify — read Present Position, should be 0
-        try:
-            raw_verify, comm_result, dxl_error = pk.read4ByteTxRx(ph, dxl_id, ADDR_PRESENT_POSITION)
-            if comm_result != COMM_SUCCESS:
-                return False, f"Verification read failed: {pk.getTxRxResult(comm_result)}", 0
-            verified_position = to_signed32(raw_verify)
-            _log(f"[Homing] Step 6/6: Verified Position = {verified_position}")
-        except Exception as e:
-            return False, f"Verification read exception: {e}", 0
-
-        if verified_position == 0:
+        if verified_position is None:
+            return False, f"Verification read failed for ID {dxl_id}", 0
+        elif verified_position == 0:
             return True, "Homing 설정 완료", 0
         else:
             return False, f"검증 실패: 위치가 0으로 초기화되지 않았습니다 (현재값: {verified_position})", verified_position
