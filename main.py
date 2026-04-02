@@ -32,8 +32,10 @@ except ImportError:
 # Constants — XC330 / Protocol 2.0
 # ──────────────────────────────────────────────
 PROTOCOL_VERSION = 2.0
-ADDR_TORQUE_ENABLE = 64      # 1 Byte
 ADDR_ID = 7                  # 1 Byte
+ADDR_HOMING_OFFSET = 20      # 4 Bytes, EEPROM (signed int32)
+ADDR_TORQUE_ENABLE = 64      # 1 Byte
+ADDR_PRESENT_POSITION = 132  # 4 Bytes, RAM (signed int32)
 TORQUE_DISABLE = 0
 TORQUE_ENABLE = 1
 DXL_ID_MIN = 0
@@ -67,14 +69,28 @@ def get_model_name(model_number):
     return DXL_MODELS.get(model_number, f"Unknown ({model_number})")
 
 
+def to_signed32(value):
+    """Convert an unsigned 32-bit value from the SDK to a signed int32."""
+    if value >= 0x80000000:
+        return value - 0x100000000
+    return value
+
+
+def to_unsigned32(value):
+    """Convert a signed int32 to an unsigned 32-bit value for the SDK."""
+    if value < 0:
+        return value + 0x100000000
+    return value
+
+
 # ──────────────────────────────────────────────
 # Worker thread for scanning (avoids UI freeze)
 # ──────────────────────────────────────────────
 class ScanWorker(QThread):
     """Background thread that pings IDs 0–252."""
-    found_id = pyqtSignal(int, int)  # emitted per found ID (dxl_id, model_number)
-    progress = pyqtSignal(int)       # emitted with current scan ID
-    finished = pyqtSignal(list)      # emitted when scan completes
+    found_id = pyqtSignal(int, int, int)  # (dxl_id, model_number, present_position)
+    progress = pyqtSignal(int)            # emitted with current scan ID
+    finished = pyqtSignal(list)           # emitted when scan completes
 
     def __init__(self, port_handler, packet_handler, stop_on_first=False, parent=None):
         super().__init__(parent)
@@ -98,7 +114,17 @@ class ScanWorker(QThread):
                 )
                 if comm_result == COMM_SUCCESS:
                     found.append(dxl_id)
-                    self.found_id.emit(dxl_id, model_number)
+                    # Read Present Position (Address 132, 4 Bytes)
+                    position = 0
+                    try:
+                        pos_raw, pos_result, pos_error = self.packet_handler.read4ByteTxRx(
+                            self.port_handler, dxl_id, ADDR_PRESENT_POSITION
+                        )
+                        if pos_result == COMM_SUCCESS:
+                            position = to_signed32(pos_raw)
+                    except Exception:
+                        pass  # position remains 0 on read failure
+                    self.found_id.emit(dxl_id, model_number, position)
                     if self.stop_on_first:
                         self._abort = True
             except Exception:
@@ -191,6 +217,98 @@ class DynamixelManager:
             return True, success_msg
         except Exception as e:
             return False, f"Verification exception: {e}"
+
+    # ── Set Zero (Homing) ─────────────────────
+    def set_zero_homing(self, dxl_id: int, log_callback=None):
+        """
+        Set the current physical position as zero (homing).
+        Returns (success: bool, message: str, verified_position: int).
+        """
+        if not self.is_open:
+            return False, "Port is not open.", 0
+
+        ph = self.port_handler
+        pk = self.packet_handler
+
+        def _log(msg):
+            if log_callback:
+                log_callback(msg)
+
+        # Step a. Torque Off (EEPROM write requires torque disabled)
+        try:
+            comm_result, dxl_error = pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+            if comm_result != COMM_SUCCESS:
+                return False, f"Torque Off failed: {pk.getTxRxResult(comm_result)}", 0
+            if dxl_error != 0:
+                _log(f"[Warning] Torque Off status: {pk.getRxPacketError(dxl_error)}")
+            _log(f"[Homing] Step 1/6: Torque disabled for ID {dxl_id}")
+        except Exception as e:
+            return False, f"Torque Off exception: {e}", 0
+
+        # Step b. Read current Homing Offset and Present Position
+        try:
+            raw_offset, comm_result, dxl_error = pk.read4ByteTxRx(ph, dxl_id, ADDR_HOMING_OFFSET)
+            if comm_result != COMM_SUCCESS:
+                return False, f"Read Homing Offset failed: {pk.getTxRxResult(comm_result)}", 0
+            if dxl_error != 0:
+                _log(f"[Warning] Read Homing Offset status: {pk.getRxPacketError(dxl_error)}")
+            current_offset = to_signed32(raw_offset)
+            _log(f"[Homing] Step 2/6: Current Homing Offset = {current_offset}")
+        except Exception as e:
+            return False, f"Read Homing Offset exception: {e}", 0
+
+        try:
+            raw_pos, comm_result, dxl_error = pk.read4ByteTxRx(ph, dxl_id, ADDR_PRESENT_POSITION)
+            if comm_result != COMM_SUCCESS:
+                return False, f"Read Present Position failed: {pk.getTxRxResult(comm_result)}", 0
+            if dxl_error != 0:
+                _log(f"[Warning] Read Present Position status: {pk.getRxPacketError(dxl_error)}")
+            current_position = to_signed32(raw_pos)
+            _log(f"[Homing] Step 2/6: Current Present Position = {current_position}")
+        except Exception as e:
+            return False, f"Read Present Position exception: {e}", 0
+
+        # Step c. Calculate new offset
+        new_offset = current_offset - current_position
+        _log(f"[Homing] Step 3/6: New Homing Offset = {current_offset} - {current_position} = {new_offset}")
+
+        # Step d. Write new Homing Offset
+        try:
+            write_value = to_unsigned32(new_offset)
+            comm_result, dxl_error = pk.write4ByteTxRx(ph, dxl_id, ADDR_HOMING_OFFSET, write_value)
+            if comm_result != COMM_SUCCESS:
+                return False, f"Write Homing Offset failed: {pk.getTxRxResult(comm_result)}", 0
+            if dxl_error != 0:
+                _log(f"[Warning] Write Homing Offset status: {pk.getRxPacketError(dxl_error)}")
+            _log(f"[Homing] Step 4/6: Homing Offset written = {new_offset}")
+        except Exception as e:
+            return False, f"Write Homing Offset exception: {e}", 0
+
+        # Step e. Torque On
+        try:
+            comm_result, dxl_error = pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
+            if comm_result != COMM_SUCCESS:
+                return False, f"Torque On failed: {pk.getTxRxResult(comm_result)}", 0
+            if dxl_error != 0:
+                _log(f"[Warning] Torque On status: {pk.getRxPacketError(dxl_error)}")
+            _log(f"[Homing] Step 5/6: Torque enabled for ID {dxl_id}")
+        except Exception as e:
+            return False, f"Torque On exception: {e}", 0
+
+        # Step f. Verify — read Present Position, should be 0
+        try:
+            raw_verify, comm_result, dxl_error = pk.read4ByteTxRx(ph, dxl_id, ADDR_PRESENT_POSITION)
+            if comm_result != COMM_SUCCESS:
+                return False, f"Verification read failed: {pk.getTxRxResult(comm_result)}", 0
+            verified_position = to_signed32(raw_verify)
+            _log(f"[Homing] Step 6/6: Verified Position = {verified_position}")
+        except Exception as e:
+            return False, f"Verification read exception: {e}", 0
+
+        if verified_position == 0:
+            return True, "Homing 설정 완료", 0
+        else:
+            return False, f"검증 실패: 위치가 0으로 초기화되지 않았습니다 (현재값: {verified_position})", verified_position
 
 
 # ──────────────────────────────────────────────
@@ -334,7 +452,41 @@ class MainWindow(QMainWindow):
         grp_setup.setLayout(lay_setup)
         root_layout.addWidget(grp_setup)
 
-        # ── Section 4: Log Viewer ─────────────
+        # ── Section 4: Set Zero (Homing) ──────
+        grp_zero = QGroupBox("Set Zero (Homing)")
+        lay_zero = QVBoxLayout()
+
+        self.btn_set_zero = QPushButton("Set Zero (Homing)")
+        self.btn_set_zero.setEnabled(False)
+        self.btn_set_zero.setStyleSheet("""
+            QPushButton {
+                background: #c67c00;
+                color: #fff;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 14px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover { background: #e09100; }
+            QPushButton:pressed { background: #a06500; }
+            QPushButton:disabled { background: #555; color: #888; }
+        """)
+        self.btn_set_zero.clicked.connect(self._set_zero)
+        lay_zero.addWidget(self.btn_set_zero)
+
+        lbl_zero_desc = QLabel(
+            "⚠  선택된 모터의 현재 물리적 위치를 0점으로 영구 설정합니다.\n"
+            "    (Sets the current physical position as the permanent zero point)"
+        )
+        lbl_zero_desc.setStyleSheet("color: #e67e22; font-size: 11px;")
+        lbl_zero_desc.setWordWrap(True)
+        lay_zero.addWidget(lbl_zero_desc)
+
+        grp_zero.setLayout(lay_zero)
+        root_layout.addWidget(grp_zero)
+
+        # ── Section 5: Log Viewer ─────────────
         grp_log = QGroupBox("Log")
         lay_log = QVBoxLayout()
         self.log_view = QPlainTextEdit()
@@ -438,6 +590,7 @@ class MainWindow(QMainWindow):
         self.btn_open.setChecked(False)
         self.btn_scan.setEnabled(False)
         self.btn_set_id.setEnabled(False)
+        self.btn_set_zero.setEnabled(False)
         self.combo_port.setEnabled(True)
         self.combo_baud.setEnabled(True)
         self.btn_refresh.setEnabled(True)
@@ -471,10 +624,10 @@ class MainWindow(QMainWindow):
         self.scan_worker.finished.connect(self._on_scan_finished)
         self.scan_worker.start()
 
-    def _on_scan_found(self, dxl_id, model_num):
+    def _on_scan_found(self, dxl_id, model_num, position):
         model_name = get_model_name(model_num)
-        self.list_ids.addItem(f"Motor ID: {dxl_id} [{model_name}]")
-        self._log(f"[Scan] Found motor at ID {dxl_id} ({model_name})")
+        self.list_ids.addItem(f"Motor ID: {dxl_id} [{model_name}] (Position: {position})")
+        self._log(f"[Scan] Found motor at ID {dxl_id} ({model_name}) — Position: {position}")
 
     def _on_scan_progress(self, current_id):
         self.lbl_scan_status.setText(f"Scanning ID {current_id}/252")
@@ -488,17 +641,19 @@ class MainWindow(QMainWindow):
         if len(found_list) == 1:
             self.lbl_current_id.setText(str(found_list[0]))
             self.btn_set_id.setEnabled(True)
+            self.btn_set_zero.setEnabled(True)
         elif len(found_list) > 1:
             self._log("[Warning] Multiple motors detected! Connect only ONE motor for safe ID change.")
 
     def _on_id_selected(self, item):
-        text = item.text()  # "Motor ID: X [Model]"
+        text = item.text()  # "Motor ID: X [Model] (Position: Y)"
         try:
             # Extract only ID
             id_part = text.split(":")[1].split("[")[0].strip()
             dxl_id = int(id_part)
             self.lbl_current_id.setText(str(dxl_id))
             self.btn_set_id.setEnabled(True)
+            self.btn_set_zero.setEnabled(True)
         except (IndexError, ValueError):
             pass
 
@@ -539,6 +694,51 @@ class MainWindow(QMainWindow):
             self.found_ids = [new_id]
         else:
             self._log(f"[ID] ✘ {msg}")
+
+    # ── Set Zero (Homing) ────────────────────
+    def _set_zero(self):
+        try:
+            dxl_id = int(self.lbl_current_id.text())
+        except ValueError:
+            self._log("[Error] No motor ID selected.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm Homing",
+            f"모터 ID {dxl_id}의 현재 위치를 0점(Zero Point)으로 설정합니다.\n"
+            f"Set motor ID {dxl_id}'s current position as zero point?\n\n"
+            "이 작업은 Homing Offset(EEPROM)을 변경합니다.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            self._log("[Info] Homing cancelled by user.")
+            return
+
+        self._log(f"[Homing] Starting homing sequence for motor ID {dxl_id} …")
+        success, msg, verified_pos = self.dxl.set_zero_homing(dxl_id, log_callback=self._log)
+
+        if success:
+            self._log(f"[Homing] ✔ {msg}")
+            QMessageBox.information(self, "Homing Complete", msg)
+            # Update the position text in the list widget
+            for i in range(self.list_ids.count()):
+                item = self.list_ids.item(i)
+                text = item.text()
+                try:
+                    id_part = text.split(":")[1].split("[")[0].strip()
+                    if int(id_part) == dxl_id:
+                        # Rebuild item text with Position: 0
+                        model_part = text.split("[")[1].split("]")[0] if "[" in text else ""
+                        item.setText(f"Motor ID: {dxl_id} [{model_part}] (Position: 0)")
+                        break
+                except (IndexError, ValueError):
+                    pass
+        else:
+            self._log(f"[Homing] ✘ {msg}")
+            self._log(f"[Homing] Verified position after attempt: {verified_pos}")
+            QMessageBox.critical(self, "Homing Failed", msg)
 
     # ── Window close ──────────────────────────
     def closeEvent(self, event):
