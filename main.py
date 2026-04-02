@@ -34,6 +34,7 @@ except ImportError:
 # ──────────────────────────────────────────────
 PROTOCOL_VERSION = 2.0
 ADDR_ID = 7                  # 1 Byte
+ADDR_OPERATING_MODE = 11     # 1 Byte, EEPROM
 ADDR_HOMING_OFFSET = 20      # 4 Bytes, EEPROM (signed int32)
 ADDR_TORQUE_ENABLE = 64      # 1 Byte
 ADDR_PRESENT_POSITION = 132  # 4 Bytes, RAM (signed int32)
@@ -41,6 +42,8 @@ TORQUE_DISABLE = 0
 TORQUE_ENABLE = 1
 DXL_ID_MIN = 0
 DXL_ID_MAX = 252
+HOMING_OFFSET_JOINT_LIMIT = 1024  # Position Control Mode limits offset to ±1024
+OP_MODE_EXTENDED_POSITION = 4     # Extended Position Control Mode (no offset limit)
 
 DEFAULT_BAUDRATE = 57600
 BAUDRATE_OPTIONS = [9600, 57600, 115200, 1000000, 2000000, 3000000, 4000000]
@@ -246,6 +249,16 @@ class DynamixelManager:
         except Exception as e:
             return False, f"Torque Off exception: {e}", 0
 
+        # Read current Operating Mode (to restore later and check offset limit)
+        original_op_mode = None
+        try:
+            raw_mode, comm_result, dxl_error = pk.read1ByteTxRx(ph, dxl_id, ADDR_OPERATING_MODE)
+            if comm_result == COMM_SUCCESS:
+                original_op_mode = raw_mode
+                _log(f"[Homing] Current Operating Mode = {original_op_mode}")
+        except Exception:
+            _log("[Warning] Could not read Operating Mode")
+
         # Step b. Read current Homing Offset and Present Position
         try:
             raw_offset, comm_result, dxl_error = pk.read4ByteTxRx(ph, dxl_id, ADDR_HOMING_OFFSET)
@@ -273,6 +286,24 @@ class DynamixelManager:
         new_offset = current_offset - current_position
         _log(f"[Homing] Step 3/6: New Homing Offset = {current_offset} - {current_position} = {new_offset}")
 
+        # Check if offset exceeds Position Control Mode limit (±1024)
+        # If so, temporarily switch to Extended Position Control Mode (mode 4)
+        mode_switched = False
+        if original_op_mode is not None and abs(new_offset) > HOMING_OFFSET_JOINT_LIMIT:
+            if original_op_mode != OP_MODE_EXTENDED_POSITION:
+                _log(f"[Homing] Offset {new_offset} exceeds ±{HOMING_OFFSET_JOINT_LIMIT} limit for mode {original_op_mode}")
+                _log(f"[Homing] Temporarily switching to Extended Position Control Mode (mode 4)")
+                try:
+                    comm_result, dxl_error = pk.write1ByteTxRx(
+                        ph, dxl_id, ADDR_OPERATING_MODE, OP_MODE_EXTENDED_POSITION
+                    )
+                    if comm_result == COMM_SUCCESS:
+                        mode_switched = True
+                    else:
+                        _log(f"[Warning] Failed to switch Operating Mode: {pk.getTxRxResult(comm_result)}")
+                except Exception as e:
+                    _log(f"[Warning] Operating Mode switch exception: {e}")
+
         # Step d. Write new Homing Offset
         try:
             write_value = to_unsigned32(new_offset)
@@ -285,7 +316,7 @@ class DynamixelManager:
         except Exception as e:
             return False, f"Write Homing Offset exception: {e}", 0
 
-        # Wait for EEPROM write to complete, then read back to verify
+        # Wait for EEPROM write, then read back to verify
         time.sleep(0.2)
         try:
             raw_readback, comm_result, dxl_error = pk.read4ByteTxRx(ph, dxl_id, ADDR_HOMING_OFFSET)
@@ -297,13 +328,20 @@ class DynamixelManager:
         except Exception:
             _log("[Warning] Could not read back Homing Offset for verification")
 
-        # Step e. Reboot motor to apply new Homing Offset
+        # Restore original Operating Mode if we switched it
+        if mode_switched and original_op_mode is not None:
+            _log(f"[Homing] Restoring Operating Mode to {original_op_mode}")
+            try:
+                pk.write1ByteTxRx(ph, dxl_id, ADDR_OPERATING_MODE, original_op_mode)
+            except Exception:
+                _log("[Warning] Could not restore Operating Mode")
+
+        # Step e. Reboot motor to apply changes cleanly
         try:
             comm_result, dxl_error = pk.reboot(ph, dxl_id)
             if comm_result != COMM_SUCCESS:
-                _log(f"[Warning] Reboot command failed: {pk.getTxRxResult(comm_result)}, trying torque on instead")
-                # Fallback: just enable torque
-                comm_result, dxl_error = pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
+                _log(f"[Warning] Reboot failed: {pk.getTxRxResult(comm_result)}, enabling torque directly")
+                pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
             else:
                 _log(f"[Homing] Step 5/6: Reboot sent to ID {dxl_id}, waiting for restart…")
         except Exception:
@@ -312,8 +350,6 @@ class DynamixelManager:
 
         # Wait for motor to reboot and come back online
         time.sleep(1.0)
-
-        # Ping to confirm motor is back
         for retry in range(10):
             try:
                 _, comm_result, _ = pk.ping(ph, dxl_id)
@@ -328,9 +364,7 @@ class DynamixelManager:
 
         # Enable torque after reboot
         try:
-            comm_result, dxl_error = pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
-            if comm_result != COMM_SUCCESS:
-                _log(f"[Warning] Torque On after reboot failed: {pk.getTxRxResult(comm_result)}")
+            pk.write1ByteTxRx(ph, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
         except Exception:
             pass
 
@@ -354,6 +388,7 @@ class DynamixelManager:
             return True, "Homing 설정 완료", 0
         else:
             return False, f"검증 실패: 위치가 0으로 초기화되지 않았습니다 (현재값: {verified_position})", verified_position
+
 
 
 # ──────────────────────────────────────────────
