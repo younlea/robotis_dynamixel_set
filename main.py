@@ -34,6 +34,7 @@ except ImportError:
 # ──────────────────────────────────────────────
 PROTOCOL_VERSION = 2.0
 ADDR_ID = 7                  # 1 Byte
+ADDR_BAUDRATE = 8           # 1 Byte, EEPROM
 ADDR_OPERATING_MODE = 11     # 1 Byte, EEPROM
 ADDR_HOMING_OFFSET = 20      # 4 Bytes, EEPROM (signed int32)
 ADDR_TORQUE_ENABLE = 64      # 1 Byte
@@ -91,15 +92,17 @@ def to_unsigned32(value):
 # Worker thread for scanning (avoids UI freeze)
 # ──────────────────────────────────────────────
 class ScanWorker(QThread):
-    """Background thread that pings IDs 0–252."""
+    """Background thread that pings IDs 0–252 across one or more baudrates."""
     found_id = pyqtSignal(int, int, int)  # (dxl_id, model_number, present_position)
     progress = pyqtSignal(int)            # emitted with current scan ID
+    baudrate_changed = pyqtSignal(int)    # emitted when switching scan baudrate
     finished = pyqtSignal(list)           # emitted when scan completes
 
-    def __init__(self, port_handler, packet_handler, stop_on_first=False, parent=None):
+    def __init__(self, port_handler, packet_handler, baudrate_list=None, stop_on_first=False, parent=None):
         super().__init__(parent)
         self.port_handler = port_handler
         self.packet_handler = packet_handler
+        self.baudrate_list = baudrate_list if baudrate_list else []
         self.stop_on_first = stop_on_first
         self._abort = False
 
@@ -108,31 +111,44 @@ class ScanWorker(QThread):
 
     def run(self):
         found = []
-        for dxl_id in range(DXL_ID_MIN, DXL_ID_MAX + 1):
+        for baud in self.baudrate_list:
             if self._abort:
                 break
-            self.progress.emit(dxl_id)
-            try:
-                model_number, comm_result, dxl_error = self.packet_handler.ping(
-                    self.port_handler, dxl_id
-                )
-                if comm_result == COMM_SUCCESS:
-                    found.append(dxl_id)
-                    # Read Present Position (Address 132, 4 Bytes)
-                    position = 0
-                    try:
-                        pos_raw, pos_result, pos_error = self.packet_handler.read4ByteTxRx(
-                            self.port_handler, dxl_id, ADDR_PRESENT_POSITION
-                        )
-                        if pos_result == COMM_SUCCESS:
-                            position = to_signed32(pos_raw)
-                    except Exception:
-                        pass  # position remains 0 on read failure
-                    self.found_id.emit(dxl_id, model_number, position)
-                    if self.stop_on_first:
-                        self._abort = True
-            except Exception:
-                pass
+            
+            self.baudrate_changed.emit(baud)
+            if not self.port_handler.setBaudRate(baud):
+                continue
+            
+            for dxl_id in range(DXL_ID_MIN, DXL_ID_MAX + 1):
+                if self._abort:
+                    break
+                self.progress.emit(dxl_id)
+                try:
+                    model_number, comm_result, dxl_error = self.packet_handler.ping(
+                        self.port_handler, dxl_id
+                    )
+                    if comm_result == COMM_SUCCESS:
+                        found.append(dxl_id)
+                        # Read Present Position (Address 132, 4 Bytes)
+                        position = 0
+                        try:
+                            pos_raw, pos_result, pos_error = self.packet_handler.read4ByteTxRx(
+                                self.port_handler, dxl_id, ADDR_PRESENT_POSITION
+                            )
+                            if pos_result == COMM_SUCCESS:
+                                position = to_signed32(pos_raw)
+                        except Exception:
+                            pass  # position remains 0 on read failure
+                        self.found_id.emit(dxl_id, model_number, position)
+                        if self.stop_on_first:
+                            self._abort = True
+                            break
+                except Exception:
+                    pass
+            
+            if self.stop_on_first and found:
+                break
+                
         self.finished.emit(found)
 
 
@@ -221,6 +237,63 @@ class DynamixelManager:
             return True, success_msg
         except Exception as e:
             return False, f"Verification exception: {e}"
+
+    # ── Baudrate change ────────────────────────
+    def set_baudrate(self, current_id: int, new_baud_index: int, new_baud_val: int, log_callback=None):
+        """
+        Change motor baudrate.
+        Returns (success: bool, message: str).
+        """
+        if not self.is_open:
+            return False, "Port is not open."
+
+        ph = self.port_handler
+        pk = self.packet_handler
+
+        def _log(msg):
+            if log_callback:
+                log_callback(msg)
+
+        # 1. Torque Off
+        try:
+            pk.write1ByteTxRx(ph, current_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+            _log(f"[Baud] Step 1/3: Torque disabled for ID {current_id}")
+        except Exception as e:
+            return False, f"Torque Off exception: {e}"
+
+        # 2. Write new Baudrate
+        try:
+            comm_result, dxl_error = pk.write1ByteTxRx(ph, current_id, ADDR_BAUDRATE, new_baud_index)
+            if comm_result != COMM_SUCCESS:
+                return False, f"Baudrate Write failed: {pk.getTxRxResult(comm_result)}"
+            if dxl_error != 0:
+                _log(f"[Warning] Baudrate Write status: {pk.getRxPacketError(dxl_error)}")
+            _log(f"[Baud] Step 2/3: Baudrate index {new_baud_index} ({new_baud_val} bps) written.")
+        except Exception as e:
+            return False, f"Baudrate Write exception: {e}"
+
+        # 3. Reboot & Reconnect
+        # Motor needs reboot to apply EEPROM baudrate change reliably.
+        try:
+            pk.reboot(ph, current_id)
+            _log(f"[Baud] Step 3/3: Reboot sent. Switching terminal to {new_baud_val} bps...")
+        except Exception:
+            pass
+        
+        time.sleep(1.0)
+        
+        # Change Port Baudrate
+        if not ph.setBaudRate(new_baud_val):
+            return False, f"Failed to switch local port to {new_baud_val} bps"
+        
+        # Verify
+        for retry in range(5):
+            time.sleep(0.3)
+            _, comm_result, _ = pk.ping(ph, current_id)
+            if comm_result == COMM_SUCCESS:
+                return True, f"Baudrate changed to {new_baud_val} bps and verified."
+        
+        return False, f"Baudrate written but motor not responding at {new_baud_val} bps after reboot."
 
     # ── Set Zero (Homing) ─────────────────────
     def set_zero_homing(self, dxl_id: int, log_callback=None):
@@ -486,6 +559,11 @@ class MainWindow(QMainWindow):
         self.cb_stop_fast.setChecked(True)
         row_scan_btn.addWidget(self.cb_stop_fast)
 
+        self.cb_auto_baud = QCheckBox("Scan Multiple Speeds (9600, 57600, 115200)")
+        self.cb_auto_baud.setStyleSheet("color: #00e676;")
+        self.cb_auto_baud.setChecked(False)
+        lay_scan.addWidget(self.cb_auto_baud)
+
         self.lbl_scan_status = QLabel("")
         row_scan_btn.addWidget(self.lbl_scan_status)
         lay_scan.addLayout(row_scan_btn)
@@ -526,6 +604,27 @@ class MainWindow(QMainWindow):
 
         grp_setup.setLayout(lay_setup)
         root_layout.addWidget(grp_setup)
+
+        # ── Section 3b: Setup Baudrate ──────────
+        grp_baud = QGroupBox("Setup Baudrate")
+        lay_baud = QVBoxLayout()
+
+        row_bnew = QHBoxLayout()
+        row_bnew.addWidget(QLabel("New Baudrate:"))
+        self.combo_set_baud = QComboBox()
+        for b in BAUDRATE_OPTIONS:
+            self.combo_set_baud.addItem(str(b), b)
+        self.combo_set_baud.setCurrentText(str(DEFAULT_BAUDRATE))
+        row_bnew.addWidget(self.combo_set_baud)
+
+        self.btn_set_baud = QPushButton("Set Target Baudrate")
+        self.btn_set_baud.setEnabled(False)
+        self.btn_set_baud.clicked.connect(self._set_baudrate)
+        row_bnew.addWidget(self.btn_set_baud)
+        lay_baud.addLayout(row_bnew)
+
+        grp_baud.setLayout(lay_baud)
+        root_layout.addWidget(grp_baud)
 
         # ── Section 4: Set Zero (Homing) ──────
         grp_zero = QGroupBox("Set Zero (Homing)")
@@ -677,6 +776,7 @@ class MainWindow(QMainWindow):
         self.btn_open.setChecked(False)
         self.btn_scan.setEnabled(False)
         self.btn_set_id.setEnabled(False)
+        self.btn_set_baud.setEnabled(False)
         self.btn_set_zero_selected.setEnabled(False)
         self.btn_set_zero_all.setEnabled(False)
         self.combo_port.setEnabled(True)
@@ -702,23 +802,39 @@ class MainWindow(QMainWindow):
         stop_on_first = self.cb_stop_fast.isChecked()
         self._log(f"[Scan] Scanning IDs 0–252 … {'(Fast Mode)' if stop_on_first else ''}")
 
+        baud_list = [self.combo_baud.currentData()]
+        if self.cb_auto_baud.isChecked():
+            # Include 9600, 57600, 115200 if not already there
+            for b in [9600, 57600, 115200]:
+                if b not in baud_list:
+                    baud_list.append(b)
+            self._log(f"[Scan] Auto-scanning multiple speeds: {baud_list}")
+
         self.scan_worker = ScanWorker(
             self.dxl.port_handler, 
             self.dxl.packet_handler, 
+            baudrate_list=baud_list,
             stop_on_first=stop_on_first
         )
         self.scan_worker.found_id.connect(self._on_scan_found)
         self.scan_worker.progress.connect(self._on_scan_progress)
+        self.scan_worker.baudrate_changed.connect(self._on_scan_baud_changed)
         self.scan_worker.finished.connect(self._on_scan_finished)
         self.scan_worker.start()
 
+    def _on_scan_baud_changed(self, baud):
+        self._log(f"[Scan] Switching to {baud} bps...")
+        self.lbl_scan_status.setText(f"Scanning @ {baud}...")
+
     def _on_scan_found(self, dxl_id, model_num, position):
         model_name = get_model_name(model_num)
-        self.list_ids.addItem(f"Motor ID: {dxl_id} [{model_name}] (Position: {position})")
-        self._log(f"[Scan] Found motor at ID {dxl_id} ({model_name}) — Position: {position}")
+        current_baud = self.scan_worker.port_handler.baudrate
+        self.list_ids.addItem(f"Motor ID: {dxl_id} [{model_name}] (Pos: {position}, @{current_baud})")
+        self._log(f"[Scan] Found motor at ID {dxl_id} ({model_name}) — Position: {position} @ {current_baud} bps")
 
     def _on_scan_progress(self, current_id):
-        self.lbl_scan_status.setText(f"Scanning ID {current_id}/252")
+        # self.lbl_scan_status.setText(f"Scanning ID {current_id}/252")
+        pass
 
     def _on_scan_finished(self, found_list):
         self.found_ids = found_list
@@ -726,26 +842,83 @@ class MainWindow(QMainWindow):
         self.lbl_scan_status.setText(f"Done — {len(found_list)} motor(s)")
         self._log(f"[Scan] Complete. Found {len(found_list)} motor(s).")
 
-        if len(found_list) == 1:
-            self.lbl_current_id.setText(str(found_list[0]))
-            self.btn_set_id.setEnabled(True)
-            self.btn_set_zero_selected.setEnabled(True)
-            self.btn_set_zero_all.setEnabled(True)
-        elif len(found_list) > 1:
-            self._log("[Warning] Multiple motors detected! Connect only ONE motor for safe ID change.")
-            self.btn_set_zero_all.setEnabled(True)
+        if len(found_list) >= 1:
+            # If multi-baud scan found something, we might be at a different baudrate than the combo_baud
+            current_port_baud = self.dxl.port_handler.baudrate
+            self.combo_baud.setCurrentText(str(current_port_baud))
+            
+            if len(found_list) == 1:
+                self.lbl_current_id.setText(str(found_list[0]))
+                self.btn_set_id.setEnabled(True)
+                self.btn_set_baud.setEnabled(True)
+                self.btn_set_zero_selected.setEnabled(True)
+                self.btn_set_zero_all.setEnabled(True)
+            else:
+                self._log("[Warning] Multiple motors detected! Connect only ONE motor for safe ID/Baud change.")
+                self.btn_set_zero_all.setEnabled(True)
 
     def _on_id_selected(self, item):
-        text = item.text()  # "Motor ID: X [Model] (Position: Y)"
+        text = item.text()  # "Motor ID: X [Model] (Pos: Y, @Z)"
         try:
             # Extract only ID
             id_part = text.split(":")[1].split("[")[0].strip()
             dxl_id = int(id_part)
             self.lbl_current_id.setText(str(dxl_id))
             self.btn_set_id.setEnabled(True)
+            self.btn_set_baud.setEnabled(True)
             self.btn_set_zero_selected.setEnabled(True)
         except (IndexError, ValueError):
             pass
+
+    # ── Baudrate Setting ──────────────────────
+    def _set_baudrate(self):
+        try:
+            current_id = int(self.lbl_current_id.text())
+        except ValueError:
+            self._log("[Error] No current ID selected.")
+            return
+
+        new_baud_val = self.combo_set_baud.currentData()
+        current_baud_val = self.dxl.port_handler.baudrate
+        
+        if new_baud_val == current_baud_val:
+            self._log(f"[Info] New baudrate is the same as current ({new_baud_val}). Nothing to do.")
+            return
+
+        # Map baudrate value to index (Protocol 2.0)
+        # 0:9600, 1:57600, 2:115200, 3:1M, 4:2M, 5:3M, 6:4M
+        baud_map = {9600:0, 57600:1, 115200:2, 1000000:3, 2000000:4, 3000000:5, 4000000:6}
+        if new_baud_val not in baud_map:
+            self._log(f"[Error] Unsupported baudrate value for index mapping: {new_baud_val}")
+            return
+        
+        new_baud_index = baud_map[new_baud_val]
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm Baudrate Change",
+            f"Change motor ID {current_id} communication speed to {new_baud_val} bps?\n\n"
+            "The motor will reboot and the tool will attempt to reconnect at the new speed.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            self._log("[Info] Baudrate change cancelled.")
+            return
+
+        self._log(f"[Baud] Changing speed for ID {current_id}: {current_baud_val} → {new_baud_val} …")
+        success, msg = self.dxl.set_baudrate(current_id, new_baud_index, new_baud_val, log_callback=self._log)
+        
+        if success:
+            self._log(f"[Baud] ✔ {msg}")
+            self.combo_baud.setCurrentText(str(new_baud_val))
+            # Refresh list
+            self.list_ids.clear()
+            self.list_ids.addItem(f"Motor ID: {current_id} [Verified at {new_baud_val}]")
+        else:
+            self._log(f"[Baud] ✘ {msg}")
+            # If it failed, it might be stuck at the old or new baudrate.
+            self._log("[Info] Try scanning again to find the motor.")
 
     # ── ID Setting ────────────────────────────
     def _set_id(self):
